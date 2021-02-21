@@ -9,7 +9,6 @@ import time
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Optional, List
 
 import boto3
@@ -31,7 +30,7 @@ LOG = logging.getLogger()
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("S3 Multipart Uploader")
-    subparsers = parser.add_subparsers(dest="operation", required=True)
+    subparsers = parser.add_subparsers(dest="operation")
 
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("--upload_id", metavar="UPLOAD_ID", type=str, default="",
@@ -39,7 +38,7 @@ def parse_args() -> Namespace:
 
     abort_parser = subparsers.add_parser("abort")
     abort_parser.add_argument("--all", action="store_true",
-                              help="Abort *all* existing multiparts uploads for bucket and key")
+                              help="Abort *all* existing multipart uploads for bucket and key")
     # abort_parser.add_argument("bucket", type=str, help="Destination bucket name")
     # abort_parser.add_argument("key", type=str, help="Destination key in the bucket")
     abort_parser.add_argument("--upload_id", type=str, default="",
@@ -49,10 +48,11 @@ def parse_args() -> Namespace:
 
 
 class ProgressMeter:
-    def __init__(self, label: str, limit: int, auto_status_secs: Optional[int] = 1):
+    def __init__(self, label: str, limit: int, auto_status_secs: Optional[int] = 1, initial: int = 0):
         self.label = label
         self.limit = limit
-        self.current = 0
+        self.initial = initial
+        self.current = initial
         self.auto_status_secs = auto_status_secs
         self.start_time = time.perf_counter()
         self.last_update_time = self.start_time
@@ -67,8 +67,8 @@ class ProgressMeter:
     def log_status(self):
         percent = 100 * self.current / self.limit
         time_passed_secs = self.last_update_time - self.start_time
-        estimated_remaining_time_secs = (
-                                                self.limit - self.current) / self.current * time_passed_secs if self.current > 0 else -1
+        estimated_remaining_time_secs = (self.limit - self.current) / (self.current - self.initial) * time_passed_secs \
+            if self.current - self.initial > 0 else -1
         LOG.info(f"{self.label} {percent:.2f}% "
                  f"(elapsed: {int(time_passed_secs)}s, ETR: ~{int(estimated_remaining_time_secs)}s)"
                  f"‚ ({self.current}/{self.limit})")
@@ -111,10 +111,17 @@ class S3MultipartUploader:
         self.dest_key = dest_key
         self.filepath_to_upload = filepath_to_upload
         self.bucket = bucket
-        self.args = args
-        self.s3 = boto3.client("s3")
 
-    def check_existing_uploads(self, expected_part_count: int) -> Optional[MultipartUploadInProgress]:
+        self.args = args
+
+        self.filesize = self.filepath_to_upload.stat().st_size
+
+        self.s3 = boto3.client("s3")
+        self.part_count: Optional[int] = None
+
+    def check_existing_uploads(self) -> Optional[MultipartUploadInProgress]:
+        expected_part_count = self.part_count
+
         response = self.s3.list_multipart_uploads(
             Bucket=self.bucket
         )
@@ -171,52 +178,81 @@ class S3MultipartUploader:
         )
 
     def start(self):
-        part_count = math.ceil(self.filepath_to_upload.stat().st_size / self.part_size_in_bytes)
+        self._determine_part_count()
 
-        if self.part_size_in_bytes < MIN_REQUIRED_PART_SIZE_S3:
-            LOG.fatal(f"Part size is smaller than minimum ({self.part_size_in_bytes}/{MIN_REQUIRED_PART_SIZE_S3}), "
-                      f"please choose a larger part size")
-            exit(1)
-        if part_count > MAX_ALLOWED_PART_COUNT_S3:
-            LOG.fatal(f"Part count required exceeds limit ({part_count}/{MAX_ALLOWED_PART_COUNT_S3}), "
-                      f"please choose a larger part size")
-            exit(1)
-
-        upload = self.check_existing_uploads(part_count)
+        upload = self.check_existing_uploads()
         if upload:
-            self.continue_upload(upload)
-            return
+            # TODO: add option to progress non-interactively
+            should_continue = input("Continue existing upload [yN]? ") == "y"
+            if should_continue:
+                self._continue_upload(upload)
+                return
+            else:
+                should_abort = input("Delete existing multi-part upload [yN]? ") == "y"
+                if should_abort:
+                    raise Exception("Not yet implemented")
 
-        LOG.info(f"Start multipart upload for {self.filepath_to_upload} to s3://{self.bucket}/{self.dest_key}")
+                should_restart = input("Re-start multi-part upload from scratch [yN]? ") == "y"
+                if not should_restart:
+                    return
+                LOG.info("Starting new upload")
 
-        LOG.info(f"Will use {part_count} parts of max. size {self.part_size_in_bytes}")
+        upload_id = self._create_multipart_upload()
 
+        uploaded_parts = self._upload_parts(start_index=0, upload_id=upload_id)
+
+        self._finalize_upload(uploaded_parts=uploaded_parts, existing_parts=[], upload_id=upload_id)
+
+    def _create_multipart_upload(self):
+        LOG.info(f"Create new multipart upload for {self.filepath_to_upload} to s3://{self.bucket}/{self.dest_key}")
+        LOG.info(f"Will use {self.part_count} parts of max. size {self.part_size_in_bytes}")
         LOG.info("Computing md5...")
         md5 = self.compute_md5(self.filepath_to_upload)
         LOG.info(f"{md5=}")
-        filesize = self.filepath_to_upload.stat().st_size
-        #        with TemporaryDirectory(prefix="s3-multipart-uploader-") as tmpdir:
-        #            LOG.info(f"tempdir: {tmpdir}")
-
         create_response = self.s3.create_multipart_upload(
             Bucket=self.bucket,
             Key=self.dest_key,
             Metadata={"md5": md5},
         )
         LOG.debug(create_response)
-
         upload_id = create_response["UploadId"]
         LOG.info(f"Got {upload_id=}")
+        return upload_id
 
+    def _finalize_upload(self, *, parts: List[UploadedPart], upload_id: str):
+        uploaded_bytes = sum([part.size for part in parts])
+        total_bytes = uploaded_bytes + sum([part.size for part in parts])
+        LOG.debug(f"Total upload size: {total_bytes}, expected: {self.filesize}")
+        if self.filesize != total_bytes:
+            LOG.error("Mismatch of sizes - most likely, the file was changed since the first multi-part upload. "
+                      "It is highly recommended to check the upload, as it is most likely incorrect!")
+        complete_response = self.s3.complete_multipart_upload(
+            Bucket=self.bucket,
+            Key=self.dest_key,
+            UploadId=upload_id,
+            MultipartUpload={
+                "Parts": [
+                    {
+                        "PartNumber": part.number,
+                        "ETag": part.etag,
+                    } for part in parts
+                ]
+            }
+        )
+        LOG.debug(complete_response)
+        LOG.info("Completed multi-part upload")
+
+    def _upload_parts(self, start_index: int, upload_id: str):
         uploaded_parts = []
-        with ProgressMeter("Uploading parts", limit=part_count) as progress:
-            for part_index in range(0, part_count):
-                start_offset = min(part_index * self.part_size_in_bytes, filesize-1)
-                end_offset = min((part_index + 1) * self.part_size_in_bytes - 1, filesize-1)
+        with ProgressMeter("Uploading parts", initial=start_index, limit=self.part_count) as progress:
+            for part_index in range(start_index, self.part_count):
+                start_offset = min(part_index * self.part_size_in_bytes, self.filesize - 1)
+                end_offset = min((part_index + 1) * self.part_size_in_bytes - 1, self.filesize - 1)
                 this_part_size = end_offset - start_offset + 1
 
                 part_number = part_index + 1  # part numbers in S3 start at 1
-                LOG.debug(f"Part #{part_number}/{part_count} (byte offset {start_offset}-{end_offset}, size={this_part_size})")
+                LOG.debug(
+                    f"Part #{part_number}/{self.part_count} (byte offset {start_offset}-{end_offset}, size={this_part_size})")
 
                 with self.filepath_to_upload.open("rb") as file:
                     file.seek(start_offset)
@@ -237,24 +273,12 @@ class S3MultipartUploader:
                 uploaded_parts.append(UploadedPart(number=part_number, last_modified="", size=this_part_size,
                                                    etag=upload_response["ETag"]))
                 progress.increment()
-
         LOG.debug(uploaded_parts)
+
         uploaded_bytes = sum([part.size for part in uploaded_parts])
-        LOG.info(f"Uploaded total size: {uploaded_bytes}, expected: {filesize}")
-        complete_response = self.s3.complete_multipart_upload(
-            Bucket=self.bucket,
-            Key=self.dest_key,
-            UploadId=upload_id,
-            MultipartUpload={
-                "Parts": [
-                    {
-                        "PartNumber": part.number,
-                        "ETag": part.etag,
-                    } for part in uploaded_parts
-                ]
-            }
-        )
-        LOG.debug(complete_response)
+        LOG.info(f"Uploaded size: {uploaded_bytes}")
+
+        return uploaded_parts
 
     @staticmethod
     def compute_md5(filepath_to_upload: Path):
@@ -268,8 +292,45 @@ class S3MultipartUploader:
         md5 = hasher.hexdigest()
         return md5
 
-    def continue_upload(self, upload: MultipartUploadInProgress):
-        raise Exception("Not yet implemented")
+    def _continue_upload(self, upload: MultipartUploadInProgress):
+        LOG.debug("Sanity check on existing parts")
+        existing_parts = sorted(upload.parts, key= lambda part: part.number)
+
+        for index, part in enumerate(existing_parts):
+            expected_part_number = index + 1  # part numbers start from 1
+            if part.number != expected_part_number:
+                # we don't support missing part numbers (i.e. starting from parts 1,2,4)
+                LOG.error(f"Incorrect part number for part {part.number}. "
+                          f"Cannot continue this upload.")
+                exit(3)
+            if part.size != self.part_size_in_bytes and index != len(existing_parts) - 1:
+                # different size allowed only for last part
+                LOG.error(f"Incorrect part size for part {part.number} (got: {part.size}, "
+                          f"expected: {self.part_size_in_bytes})."
+                          f"Cannot continue this upload.")
+                exit(3)
+
+        start_index = len(existing_parts)
+        start_part_number = start_index + 1
+        LOG.debug(f"Part look okay, will continue from part {start_part_number}")
+
+        upload_id = upload.upload_id
+
+        new_uploaded_parts = self._upload_parts(start_index=start_index, upload_id=upload_id)
+        all_parts = existing_parts + new_uploaded_parts
+        self._finalize_upload(parts=all_parts, upload_id=upload_id)
+
+    def _determine_part_count(self):
+        self.part_count = math.ceil(self.filesize / self.part_size_in_bytes)
+
+        if self.part_size_in_bytes < MIN_REQUIRED_PART_SIZE_S3:
+            LOG.fatal(f"Part size is smaller than minimum ({self.part_size_in_bytes}/{MIN_REQUIRED_PART_SIZE_S3}), "
+                      f"please choose a larger part size")
+            exit(1)
+        if self.part_count > MAX_ALLOWED_PART_COUNT_S3:
+            LOG.fatal(f"Part count required exceeds limit ({self.part_count}/{MAX_ALLOWED_PART_COUNT_S3}), "
+                      f"please choose a larger part size")
+            exit(1)
 
     def abort(self):
         if self.args.all:
@@ -317,7 +378,8 @@ def main():
         args=args,
     )
 
-    s3_multipart_uploader.__getattribute__(args.operation)()
+    operation = args.operation or "start"
+    s3_multipart_uploader.__getattribute__(operation)()
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import time
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import boto3
 
@@ -28,23 +28,32 @@ logging.getLogger("botocore.utils").setLevel(logging.WARNING)
 LOG = logging.getLogger()
 
 
-def parse_args() -> Namespace:
-    parser = ArgumentParser("S3 Multipart Uploader")
+def parse_args() -> Tuple[ArgumentParser, Namespace]:
+    parser = ArgumentParser()
     subparsers = parser.add_subparsers(dest="operation")
 
-    start_parser = subparsers.add_parser("start")
-    start_parser.add_argument("--upload_id", metavar="UPLOAD_ID", type=str, default="",
-                              help="UploadId from previously started upload")
+    upload_parser = subparsers.add_parser("upload", aliases=["up", "u"])
+    upload_parser.add_argument("--upload_id", metavar="UPLOAD_ID", type=str, default="",
+                               help="UploadId from previously started upload")
+    upload_parser.add_argument("file", metavar="<File>", type=str, help="Local file path to upload")
+    upload_parser.add_argument("bucket", metavar="<Bucket>", type=str,
+                               help="Destination S3 Bucket")
+    upload_parser.add_argument("key", metavar="<Key>", type=str, nargs="?",
+                               help="Destination S3 Key (optional, will use filename without path of <File>)")
 
     abort_parser = subparsers.add_parser("abort")
     abort_parser.add_argument("--all", action="store_true",
                               help="Abort *all* existing multipart uploads for bucket and key")
-    # abort_parser.add_argument("bucket", type=str, help="Destination bucket name")
-    # abort_parser.add_argument("key", type=str, help="Destination key in the bucket")
+    abort_parser.add_argument("file", metavar="<File>", type=str,
+                               help="Local file path to upload (used only to determine key for abort)")
+    abort_parser.add_argument("bucket", metavar="<Bucket>", type=str,
+                               help="Destination S3 Bucket")
+    abort_parser.add_argument("key", metavar="<Key>", type=str,
+                               help="Destination S3 Key")
     abort_parser.add_argument("--upload_id", type=str, default="",
                               help="UploadId to abort, from previously started upload")
 
-    return parser.parse_args()
+    return parser, parser.parse_args()
 
 
 class ProgressMeter:
@@ -177,7 +186,7 @@ class S3MultipartUploader:
             parts=parts,
         )
 
-    def start(self):
+    def upload(self):
         self._determine_part_count()
 
         upload = self.check_existing_uploads()
@@ -201,7 +210,7 @@ class S3MultipartUploader:
 
         uploaded_parts = self._upload_parts(start_index=0, upload_id=upload_id)
 
-        self._finalize_upload(uploaded_parts=uploaded_parts, existing_parts=[], upload_id=upload_id)
+        self._finalize_upload(parts=uploaded_parts, upload_id=upload_id)
 
     def _create_multipart_upload(self):
         LOG.info(f"Create new multipart upload for {self.filepath_to_upload} to s3://{self.bucket}/{self.dest_key}")
@@ -360,25 +369,30 @@ class S3MultipartUploader:
 
 
 def main():
-    args = parse_args()
+    parser, args = parse_args()
     LOG.info(args)
 
-    # TODO: read from cli
-    bucket = "kilgerm1"
-    filepath_name_to_upload = "testdata/testfile"
+    filepath_name_to_upload = args.file
     filepath_to_upload = Path(filepath_name_to_upload)
-    dest_key = "testfile"  # from filepath
+    dest_key = args.key or filepath_to_upload.name
+    if not dest_key:
+        print("Could not infer key from input file")
+        parser.print_usage()
+        exit(2)
+
     part_size = 5 * 1024 * 1024
 
     s3_multipart_uploader = S3MultipartUploader(
-        bucket=bucket,
+        bucket=args.bucket,
         filepath_to_upload=filepath_to_upload,
         dest_key=dest_key,
         part_size_in_bytes=part_size,
         args=args,
     )
 
-    operation = args.operation or "start"
+    operation = args.operation
+    if operation in ["upload", "up", "u"]:
+        operation = "upload"
     s3_multipart_uploader.__getattribute__(operation)()
 
 

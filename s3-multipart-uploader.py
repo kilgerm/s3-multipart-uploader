@@ -113,7 +113,7 @@ class S3MultipartUploader:
             bucket: str,
             filepath_to_upload: Path,
             dest_key: str,
-            part_size_in_bytes: int,
+            part_size_in_bytes: Optional[int],
             args: Namespace,
     ):
         self.part_size_in_bytes = part_size_in_bytes
@@ -123,10 +123,11 @@ class S3MultipartUploader:
 
         self.args = args
 
+        self.compute_md5 = False
         self.filesize = self.filepath_to_upload.stat().st_size
-
-        self.s3 = boto3.client("s3")
         self.part_count: Optional[int] = None
+        self._determine_part_count()
+        self.s3 = boto3.client("s3")
 
     def check_existing_uploads(self) -> Optional[MultipartUploadInProgress]:
         expected_part_count = self.part_count
@@ -187,7 +188,6 @@ class S3MultipartUploader:
         )
 
     def upload(self):
-        self._determine_part_count()
 
         upload = self.check_existing_uploads()
         if upload:
@@ -215,17 +215,23 @@ class S3MultipartUploader:
     def _create_multipart_upload(self):
         LOG.info(f"Create new multipart upload for {self.filepath_to_upload} to s3://{self.bucket}/{self.dest_key}")
         LOG.info(f"Will use {self.part_count} parts of max. size {self.part_size_in_bytes}")
-        LOG.info("Computing md5...")
-        md5 = self.compute_md5(self.filepath_to_upload)
-        LOG.info(f"{md5=}")
+
+        if self.compute_md5:
+            LOG.info("Computing md5...")
+            md5 = self.compute_md5(self.filepath_to_upload)
+            LOG.info(f"md5={md5}")
+        else:
+            md5 = None
+
+        metadata = {"md5": md5} if md5 is not None else {}
         create_response = self.s3.create_multipart_upload(
             Bucket=self.bucket,
             Key=self.dest_key,
-            Metadata={"md5": md5},
+            Metadata=metadata,
         )
         LOG.debug(create_response)
         upload_id = create_response["UploadId"]
-        LOG.info(f"Got {upload_id=}")
+        LOG.info(f"Got upload_id={upload_id}")
         return upload_id
 
     def _finalize_upload(self, *, parts: List[UploadedPart], upload_id: str):
@@ -295,9 +301,11 @@ class S3MultipartUploader:
         file_size = filepath_to_upload.stat().st_size
         with filepath_to_upload.open("rb") as file:
             with ProgressMeter("Computing file hash", limit=file_size) as progress:
-                while r := file.read(BLOCKSIZE_FOR_HASHING):
+                r = file.read(BLOCKSIZE_FOR_HASHING)
+                while r:
                     hasher.update(r)
                     progress.increment(BLOCKSIZE_FOR_HASHING)
+                    r = file.read(BLOCKSIZE_FOR_HASHING)
         md5 = hasher.hexdigest()
         return md5
 
@@ -330,6 +338,10 @@ class S3MultipartUploader:
         self._finalize_upload(parts=all_parts, upload_id=upload_id)
 
     def _determine_part_count(self):
+        if not self.part_size_in_bytes:
+            self.part_size_in_bytes = max(math.ceil(self.filesize / MAX_ALLOWED_PART_COUNT_S3), MIN_REQUIRED_PART_SIZE_S3)
+            LOG.info("Auto determined part size to {self.part_size_in_bytes}")
+
         self.part_count = math.ceil(self.filesize / self.part_size_in_bytes)
 
         if self.part_size_in_bytes < MIN_REQUIRED_PART_SIZE_S3:
@@ -380,7 +392,7 @@ def main():
         parser.print_usage()
         exit(2)
 
-    part_size = 5 * 1024 * 1024
+    part_size = None
 
     s3_multipart_uploader = S3MultipartUploader(
         bucket=args.bucket,

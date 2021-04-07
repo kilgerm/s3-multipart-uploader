@@ -46,6 +46,8 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     abort_parser = subparsers.add_parser("abort")
     abort_parser.add_argument("--all", action="store_true",
                               help="Abort *all* existing multipart uploads for bucket and key")
+    abort_parser.add_argument("--list", action="store_true",
+                              help="List existing multipart uploads for bucket and key")
     abort_parser.add_argument("file", metavar="<File>", type=str,
                                help="Local file path to upload (used only to determine key for abort)")
     abort_parser.add_argument("bucket", metavar="<Bucket>", type=str,
@@ -390,7 +392,7 @@ class S3MultipartUploader:
             exit(1)
 
     def abort(self):
-        if self.args.all:
+        if self.args.all or self.args.list:
             response = self.s3.list_multipart_uploads(
                 Bucket=self.bucket
             )
@@ -399,15 +401,24 @@ class S3MultipartUploader:
                 upload_id=upload["UploadId"],
                 started_at=upload["Initiated"],
                 initiator=upload["Initiator"]["ID"])
-                for upload in response.get("Uploads", []) if upload["Key"] == self.dest_key]
-            LOG.info(f"Aborting {len(matching)} uploads for s3://{self.bucket}/{self.dest_key} ...")
-            for mpupload in matching:
-                LOG.info(f"Aborting {mpupload.upload_id}")
-                self.s3.abort_multipart_upload(
-                    Bucket=self.bucket,
-                    Key=self.dest_key,
-                    UploadId=mpupload.upload_id,
-                )
+                for upload in response.get("Uploads", []) if upload["Key"] == self.dest_key or self.dest_key is None]
+
+            if len(matching) > 0:
+                print(f"Found existing uploads for bucket {self.bucket} and key {self.dest_key}:")
+                for mpupload in matching:
+                    print(f"* {mpupload.upload_id}   {mpupload.started_at}   {mpupload.initiator}")
+            else:
+                print(f"No existing uploads for bucket {self.bucket} and key {self.dest_key}")
+
+            if self.args.all:
+                LOG.info(f"Aborting {len(matching)} uploads for s3://{self.bucket}/{self.dest_key} ...")
+                for mpupload in matching:
+                    LOG.info(f"Aborting {mpupload.upload_id}")
+                    self.s3.abort_multipart_upload(
+                        Bucket=self.bucket,
+                        Key=self.dest_key,
+                        UploadId=mpupload.upload_id,
+                    )
         else:
             LOG.debug(self.s3.abort_multipart_upload(
                 Bucket=self.bucket,

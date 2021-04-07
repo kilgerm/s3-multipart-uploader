@@ -91,6 +91,20 @@ class ProgressMeter:
         LOG.info(f"Finished: {self.label}")
 
 
+class OutFormatter:
+    def __init__(self):
+        try:
+            import humanize
+            self._format_sizesize = lambda size: humanize.filesize.naturalsize(size)
+        except ModuleNotFoundError:
+            self._format_sizesize = None
+
+    def filesize(self, size: int) -> str:
+        if self._format_sizesize:
+            return self._format_sizesize(size) + f" ({size})"
+        return f"{size}"
+
+
 @dataclass
 class UploadedPart:
     number: int
@@ -115,7 +129,9 @@ class S3MultipartUploader:
             dest_key: str,
             part_size_in_bytes: Optional[int],
             args: Namespace,
+            out_formatter: OutFormatter = OutFormatter(),
     ):
+        self._out_formatter = out_formatter
         self.part_size_in_bytes = part_size_in_bytes
         self.dest_key = dest_key
         self.filepath_to_upload = filepath_to_upload
@@ -233,7 +249,7 @@ class S3MultipartUploader:
 
     def _create_multipart_upload(self):
         LOG.info(f"Create new multipart upload for {self.filepath_to_upload} to s3://{self.bucket}/{self.dest_key}")
-        LOG.info(f"Will use {self.part_count} parts of max. size {self.part_size_in_bytes}")
+        LOG.info(f"Will use {self.part_count} parts of max. size {self._out_formatter.filesize(self.part_size_in_bytes)}")
 
         if self.compute_md5:
             LOG.info("Computing md5...")
@@ -255,7 +271,7 @@ class S3MultipartUploader:
 
     def _finalize_upload(self, *, parts: List[UploadedPart], upload_id: str):
         total_bytes = sum([part.size for part in parts])
-        LOG.debug(f"Total upload size: {total_bytes}, expected: {self.filesize}")
+        LOG.debug(f"Total upload size: {self._out_formatter.filesize(total_bytes)}, expected: {self._out_formatter.filesize(self.filesize)}")
         if self.filesize != total_bytes:
             LOG.error("Mismatch of sizes - most likely, the file was changed since the first multi-part upload. "
                       "It is highly recommended to check the upload, as it is most likely incorrect!")
@@ -285,7 +301,7 @@ class S3MultipartUploader:
 
                 part_number = part_index + 1  # part numbers in S3 start at 1
                 LOG.debug(
-                    f"Part #{part_number}/{self.part_count} (byte offset {start_offset}-{end_offset}, size={this_part_size})")
+                    f"Part #{part_number}/{self.part_count} (byte offset {start_offset}-{end_offset}, size={self._out_formatter.filesize(this_part_size)})")
 
                 with self.filepath_to_upload.open("rb") as file:
                     file.seek(start_offset)
@@ -309,7 +325,7 @@ class S3MultipartUploader:
         LOG.debug(uploaded_parts)
 
         uploaded_bytes = sum([part.size for part in uploaded_parts])
-        LOG.info(f"Uploaded size: {uploaded_bytes}")
+        LOG.info(f"Uploaded size: {self._out_formatter.filesize(uploaded_bytes)}")
 
         return uploaded_parts
 
@@ -358,7 +374,7 @@ class S3MultipartUploader:
     def _determine_part_count(self):
         if not self.part_size_in_bytes:
             self.part_size_in_bytes = max(math.ceil(self.filesize / MAX_ALLOWED_PART_COUNT_S3), MIN_REQUIRED_PART_SIZE_S3)
-            LOG.info("Auto determined part size to {self.part_size_in_bytes}")
+            LOG.info(f"Auto determined part size to {self._out_formatter.filesize(self.part_size_in_bytes)}")
 
         self.part_count = math.ceil(self.filesize / self.part_size_in_bytes)
 

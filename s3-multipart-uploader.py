@@ -167,15 +167,13 @@ class S3MultipartUploader:
         LOG.info(
             f"Found existing upload started at {match.started_at} by {match.initiator}, upload_id: \"{upload_id}\"")
 
-        parts_response = self.s3.list_parts(Bucket=self.bucket, Key=self.dest_key, UploadId=upload_id,
-                                            MaxParts=expected_part_count + 1)
-        LOG.debug(parts_response)
-        parts = [UploadedPart(
-            number=part["PartNumber"],
-            last_modified=part["LastModified"],
-            size=part["Size"],
-            etag=part["ETag"],
-        ) for part in parts_response.get("Parts", [])]
+        parts = []
+        new_parts, is_truncated, next_part_number_marker = self._load_parts(upload_id=upload_id, part_number_marker=None)
+        parts.extend(new_parts)
+
+        while is_truncated:
+            new_parts, is_truncated, next_part_number_marker = self._load_parts(upload_id=upload_id, part_number_marker=next_part_number_marker)
+            parts.extend(new_parts)
 
         num_parts = len(parts)
         LOG.info(f"Found {num_parts} uploaded parts")
@@ -186,6 +184,27 @@ class S3MultipartUploader:
             initiator=match.initiator,
             parts=parts,
         )
+
+    def _load_parts(self, upload_id: str, part_number_marker: Optional[int]) -> Tuple[List[UploadedPart], bool, Optional[int]]:
+        if part_number_marker is None:
+            parts_response = self.s3.list_parts(Bucket=self.bucket, Key=self.dest_key, UploadId=upload_id, MaxParts=1000)
+        else:
+            parts_response = self.s3.list_parts(Bucket=self.bucket, Key=self.dest_key, UploadId=upload_id, MaxParts=1000,
+                                                PartNumberMarker=part_number_marker)
+        LOG.debug(parts_response)
+        next_part_number_marker = parts_response["NextPartNumberMarker"] if "NextPartNumberMarker" in parts_response else None
+        is_truncated = "IsTruncated" in parts_response and parts_response["IsTruncated"]
+        new_parts = [
+                UploadedPart(
+                    number=part["PartNumber"],
+                    last_modified=part["LastModified"],
+                    size=part["Size"],
+                    etag=part["ETag"],
+                )
+                for part in parts_response.get("Parts", [])
+            ]
+        LOG.debug(f"Found {len(new_parts)} parts from response, next PartNumberMarker={next_part_number_marker}")
+        return new_parts, is_truncated, next_part_number_marker
 
     def upload(self):
 
@@ -329,7 +348,7 @@ class S3MultipartUploader:
 
         start_index = len(existing_parts)
         start_part_number = start_index + 1
-        LOG.debug(f"Part look okay, will continue from part {start_part_number}")
+        LOG.debug(f"Parts look consistent, will continue from part {start_part_number}")
 
         upload_id = upload.upload_id
 

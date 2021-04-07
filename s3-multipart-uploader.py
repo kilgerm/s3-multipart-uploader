@@ -6,6 +6,7 @@ import logging
 import math
 import sys
 import time
+import os
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,8 +22,9 @@ MIN_REQUIRED_PART_SIZE_S3 = 5 * 1024 * 1024
 
 BLOCKSIZE_FOR_HASHING = 1024 * 1024
 
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-logging.getLogger("botocore").setLevel(logging.INFO)
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(stream=sys.stdout, level=log_level)
+logging.getLogger("botocore").setLevel(logging.WARNING)
 logging.getLogger("botocore.utils").setLevel(logging.WARNING)
 
 LOG = logging.getLogger()

@@ -60,8 +60,30 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     return parser, parser.parse_args()
 
 
+class OutFormatter:
+    def __init__(self):
+        try:
+            import humanize
+            self._format_sizesize = lambda size: humanize.filesize.naturalsize(size)
+            self._format_secs = lambda secs: humanize.precisedelta(secs)
+        except ModuleNotFoundError:
+            self._format_sizesize = None
+            self._format_secs = None
+
+    def filesize(self, size: int) -> str:
+        if self._format_sizesize:
+            return self._format_sizesize(size) + f" ({size})"
+        return f"{size}"
+
+    def time(self, seconds: int) -> str:
+        if self._format_secs:
+            return self._format_secs(seconds)
+        return f"{seconds}s"
+
+
 class ProgressMeter:
-    def __init__(self, label: str, limit: int, auto_status_secs: Optional[int] = 1, initial: int = 0):
+    def __init__(self, label: str, limit: int, auto_status_secs: Optional[int] = 1, initial: int = 0,
+                 out_formatter: OutFormatter = OutFormatter()):
         self.label = label
         self.limit = limit
         self.initial = initial
@@ -69,6 +91,7 @@ class ProgressMeter:
         self.auto_status_secs = auto_status_secs
         self.start_time = time.perf_counter()
         self.last_update_time = self.start_time
+        self._out_formatter = out_formatter
 
     def increment(self, by: int = 1):
         self.current = min(self.current + by, self.limit)
@@ -83,7 +106,7 @@ class ProgressMeter:
         estimated_remaining_time_secs = (self.limit - self.current) / (self.current - self.initial) * time_passed_secs \
             if self.current - self.initial > 0 else -1
         LOG.info(f"{self.label} {percent:.2f}% "
-                 f"(elapsed: {int(time_passed_secs)}s, ETR: ~{int(estimated_remaining_time_secs)}s)"
+                 f"(elapsed: {self._out_formatter.time(int(time_passed_secs))}, ETR: ~{self._out_formatter.time(int(estimated_remaining_time_secs))})"
                  f"‚ ({self.current}/{self.limit})")
 
     def __enter__(self) -> ProgressMeter:
@@ -93,20 +116,6 @@ class ProgressMeter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.log_status()
         LOG.info(f"Finished: {self.label}")
-
-
-class OutFormatter:
-    def __init__(self):
-        try:
-            import humanize
-            self._format_sizesize = lambda size: humanize.filesize.naturalsize(size)
-        except ModuleNotFoundError:
-            self._format_sizesize = None
-
-    def filesize(self, size: int) -> str:
-        if self._format_sizesize:
-            return self._format_sizesize(size) + f" ({size})"
-        return f"{size}"
 
 
 @dataclass

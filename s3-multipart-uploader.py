@@ -254,8 +254,7 @@ class S3MultipartUploader:
         return upload_id
 
     def _finalize_upload(self, *, parts: List[UploadedPart], upload_id: str):
-        uploaded_bytes = sum([part.size for part in parts])
-        total_bytes = uploaded_bytes + sum([part.size for part in parts])
+        total_bytes = sum([part.size for part in parts])
         LOG.debug(f"Total upload size: {total_bytes}, expected: {self.filesize}")
         if self.filesize != total_bytes:
             LOG.error("Mismatch of sizes - most likely, the file was changed since the first multi-part upload. "

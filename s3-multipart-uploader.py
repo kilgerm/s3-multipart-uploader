@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 
 import boto3
+import botocore.exceptions
 
 # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#S3.Client.create_multipart_upload
 
@@ -22,10 +23,6 @@ MIN_REQUIRED_PART_SIZE_S3 = 5 * 1024 * 1024
 
 BLOCKSIZE_FOR_HASHING = 1024 * 1024
 
-log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(stream=sys.stdout, level=log_level)
-logging.getLogger("botocore").setLevel(logging.WARNING)
-logging.getLogger("botocore.utils").setLevel(logging.WARNING)
 
 LOG = logging.getLogger()
 
@@ -42,6 +39,8 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
                                help="Destination S3 Bucket")
     upload_parser.add_argument("key", metavar="<Key>", type=str, nargs="?",
                                help="Destination S3 Key (optional, will use filename without path of <File>)")
+    upload_parser.add_argument("--part-size", type=int, default=None,
+                               help="Part size for upload in bytes")
 
     abort_parser = subparsers.add_parser("abort")
     abort_parser.add_argument("--all", action="store_true",
@@ -141,7 +140,7 @@ class S3MultipartUploader:
             filepath_to_upload: Path,
             dest_key: str,
             part_size_in_bytes: Optional[int],
-            args: Namespace,
+            args: Namespace,  # TODO: remove args from here
             out_formatter: OutFormatter = OutFormatter(),
     ):
         self._out_formatter = out_formatter
@@ -236,6 +235,9 @@ class S3MultipartUploader:
         return new_parts, is_truncated, next_part_number_marker
 
     def upload(self):
+        if self._is_existing_in_s3():
+            LOG.info(f"Skip file already existing in S3 {self.filepath_to_upload}")
+            return
 
         upload = self.check_existing_uploads()
         if upload:
@@ -259,6 +261,13 @@ class S3MultipartUploader:
         uploaded_parts = self._upload_parts(start_index=0, upload_id=upload_id)
 
         self._finalize_upload(parts=uploaded_parts, upload_id=upload_id)
+
+    def _is_existing_in_s3(self) -> bool:
+        try:
+            response = self.s3.head_object(Bucket=self.bucket, Key=self.dest_key)
+            return True
+        except botocore.exceptions.ClientError:
+            return False
 
     def _create_multipart_upload(self):
         LOG.info(f"Create new multipart upload for {self.filepath_to_upload} to s3://{self.bucket}/{self.dest_key}")
@@ -436,33 +445,69 @@ class S3MultipartUploader:
             ))
 
 
-def main():
-    parser, args = parse_args()
-    LOG.info(args)
+class S3MultiPartCli:
+    def run(self):
+        parser, args = parse_args()
 
-    filepath_name_to_upload = args.file
-    filepath_to_upload = Path(filepath_name_to_upload)
-    dest_key = args.key or filepath_to_upload.name
-    if not dest_key:
-        print("Could not infer key from input file")
-        parser.print_usage()
-        exit(2)
+        LOG.debug(args)
 
-    part_size = None
+        filepath_name_to_upload = args.file
+        filepath_to_upload = Path(filepath_name_to_upload)
 
-    s3_multipart_uploader = S3MultipartUploader(
-        bucket=args.bucket,
-        filepath_to_upload=filepath_to_upload,
-        dest_key=dest_key,
-        part_size_in_bytes=part_size,
-        args=args,
-    )
+        if filepath_to_upload.is_dir():
+            LOG.debug("Directory mode")
 
-    operation = args.operation
-    if operation in ["upload", "up", "u"]:
-        operation = "upload"
-    s3_multipart_uploader.__getattribute__(operation)()
+            if not args.key:
+                print("Destination key (prefix) is required for directories")
+                parser.print_usage()
+                exit(2)
+
+            for filepath in sorted(filepath_to_upload.iterdir()):
+                if not filepath.is_file():
+                    LOG.debug(f"Skipping non-file {filepath}")
+                    continue
+                dest_key = f"{args.key}/{filepath.name}"
+                self._upload_file(filepath, dest_key, args)
+
+        elif filepath_to_upload.is_file():
+            dest_key = args.key or filepath_to_upload.name
+            if not dest_key:
+                print("Could not infer key from input file")
+                parser.print_usage()
+                exit(2)
+
+            self._upload_file(filepath_to_upload, dest_key, args)
+        else:
+            print(f"Not a file or dir: {filepath_to_upload}")
+            parser.print_usage()
+            exit(2)
+
+    def _upload_file(self, filepath_to_upload: Path, dest_key: str, args: Namespace):
+        LOG.debug(f"Upload {filepath_to_upload} to {dest_key}")
+        part_size = args.part_size
+
+        s3_multipart_uploader = S3MultipartUploader(
+            bucket=args.bucket,
+            filepath_to_upload=filepath_to_upload,
+            dest_key=dest_key,
+            part_size_in_bytes=part_size,
+            args=args,
+        )
+
+        operation = args.operation
+        if operation in ["upload", "up", "u"]:
+            operation = "upload"
+        s3_multipart_uploader.__getattribute__(operation)()
+
+
+def init_logging():
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(stream=sys.stdout, level=log_level)
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("botocore.utils").setLevel(logging.WARNING)
 
 
 if __name__ == "__main__":
-    main()
+    init_logging()
+    s3_cli = S3MultiPartCli()
+    s3_cli.run()
